@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedLists #-}
+
 module Dependencies (testDependencies) where
 
 import Test.Tasty
@@ -40,12 +42,25 @@ circDepTree2 = testGroup "dependency test"
 
 circDepTests :: [TestTree]
 circDepTests = do
-  (i, tree) <- zip [1,2] [circDepTree1, circDepTree2]
+  (i, expectedCycles, tree) <-
+    zip3
+      [1,2]
+      [circDeps1, circDeps2]
+      [circDepTree1, circDepTree2]
+
   return $ testCase ("Circular dependencies " ++ show i) $ do
     r <- try $ launchTestTree mempty tree $ \_ -> return $ \_ -> return ()
     case r of
-      Left DependencyLoop -> return ()
+      Left (DependencyLoop cycles) ->
+        assertEqual "Unexpected cycles" expectedCycles cycles
       _ -> assertFailure $ show r
+  where
+    circDeps1 = [[["One"]]]
+    circDeps2 = [[
+        ["dependency test", "One"]
+      , ["dependency test", "Three"]
+      , ["dependency test", "Two"]
+      ]]
 
 -- | Check the semantics of dependencies
 generalDependencyTests :: [TestTree]
