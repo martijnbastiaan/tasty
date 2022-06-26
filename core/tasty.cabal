@@ -48,6 +48,7 @@ library
     Test.Tasty.Patterns.Parser
     Test.Tasty.Patterns.Printer
     Test.Tasty.Patterns.Eval
+    Test.Tasty.Patterns.Trie
   other-modules:
     Control.Concurrent.Async
     Test.Tasty.Parallel,

@@ -1,5 +1,14 @@
-{-# LANGUAGE RankNTypes, ViewPatterns #-}
-module Test.Tasty.Patterns.Eval (Path, eval, withFields, asB) where
+{-# LANGUAGE RankNTypes, ViewPatterns, LambdaCase #-}
+module Test.Tasty.Patterns.Eval
+  ( ExactPath
+  , ExactPathComponent(..)
+  , LeftOrRight(L, R)
+  , Path
+  , exactPathToPath
+  , eval
+  , withFields
+  , asB
+  ) where
 
 import Prelude hiding (Ordering(..))
 import Control.Monad ((<=<))
@@ -16,7 +25,34 @@ import Control.Applicative
 import Data.Traversable
 #endif
 
+data LeftOrRight = L | R
+  deriving (Show, Eq, Ord)
+
+data ExactPathComponent
+  = EpcSingleTest String
+  | EpcTestGroup String Int
+  | EpcPlusTestOptions
+  | EpcWithResource
+  | EpcAskOptions
+  | EpcAfter
+  | EpcAfterTree LeftOrRight
+  deriving (Show, Eq, Ord)
+
+type ExactPath = Seq.Seq ExactPathComponent
 type Path = Seq.Seq String
+
+exactPathToPath :: ExactPath -> Path
+exactPathToPath = Seq.fromList . catMaybes . toList . fmap toName
+ where
+  toName :: ExactPathComponent -> Maybe String
+  toName = \case
+    EpcSingleTest s -> Just s
+    EpcTestGroup s _ -> Just s
+    EpcPlusTestOptions -> Nothing
+    EpcWithResource -> Nothing
+    EpcAskOptions -> Nothing
+    EpcAfter -> Nothing
+    EpcAfterTree _ -> Nothing
 
 data Value
   = VN !Int

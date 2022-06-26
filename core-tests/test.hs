@@ -10,7 +10,9 @@ import Options.Applicative
 import Resources
 import Timeouts
 import Dependencies
+import AfterTree
 import AWK
+import Trie
 
 main :: IO ()
 main = do
@@ -23,6 +25,8 @@ mainGroup = do
     [ testResources
     , testTimeouts
     , testDependencies
+    , testAfterTree
+    , testTrie
     , patternTests
     , awkTests_
     , optionMessagesTests
@@ -66,7 +70,7 @@ getTestNames :: OptionSet -> TestTree -> [String]
 getTestNames =
   foldTestTree
     trivialFold
-      { foldSingle = \_ name _ -> [name]
+      { foldSingle = \_ _ name _ -> [name]
       , foldGroup = \_opts n l -> map ((n ++ ".") ++) l
       }
 

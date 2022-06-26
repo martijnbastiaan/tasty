@@ -8,12 +8,14 @@ import Control.Exception
 import Test.Tasty.Providers.ConsoleFormat
 import Test.Tasty.Options
 import Test.Tasty.Patterns
+import Test.Tasty.Patterns.Eval
 import Test.Tasty.Patterns.Types
 import Data.Foldable
-import qualified Data.Sequence as Seq
 import Data.Monoid
 import Data.Typeable
 import qualified Data.Map as Map
+import Data.Maybe (maybeToList)
+import Data.Sequence ((|>))
 import Data.Tagged
 import GHC.Generics
 import Prelude  -- Silence AMP and FTP import warnings
@@ -224,6 +226,9 @@ data TestTree
   | After DependencyType Expr TestTree
     -- ^ Only run after all tests that match a given pattern finish
     -- (and, depending on the 'DependencyType', succeed)
+  | AfterTree DependencyType TestTree TestTree
+    -- ^ Only run tests in the right 'TestTree' after tests in the left
+    -- 'TestTree' finish (and, depending on the 'DependencyType', succeed)
 
 -- | Create a named group of test cases or other groups
 testGroup :: TestName -> [TestTree] -> TestTree
@@ -303,16 +308,41 @@ after deptype s =
     Nothing -> error $ "Could not parse pattern " ++ show s
     Just e -> after_ deptype e
 
+-- | Run given 'TestTree's one after another.
+--
+-- @since 1.5
+afterTree
+  :: DependencyType -- ^ whether to run the tests even if some of the dependencies fail
+  -> TestTree -- ^ dependencies
+  -> TestTree -- ^ tests to run after all dependencies have finished
+  -> TestTree
+afterTree = AfterTree
+
+-- | Run given 'TestTree's one after another.
+--
+-- @since 1.5
+sequentialTestGroup
+  :: TestName -- ^ Test group name
+  -> DependencyType -- ^ whether to run the tests even if some of the dependencies fail
+  -> [TestTree] -- ^ tests to run sequentially
+  -> TestTree
+sequentialTestGroup groupName depType =
+  testGroup groupName . maybeToList . go
+ where
+  go [] = Nothing
+  go (t:ts) = Just (foldl' (afterTree depType) t ts)
+
 -- | An algebra for folding a `TestTree`.
 --
 -- Instead of constructing fresh records, build upon `trivialFold`
 -- instead. This way your code won't break when new nodes/fields are
 -- indroduced.
 data TreeFold b = TreeFold
-  { foldSingle :: forall t . IsTest t => OptionSet -> TestName -> t -> b
+  { foldSingle :: forall t . IsTest t => OptionSet -> ExactPath -> TestName -> t -> b
   , foldGroup :: OptionSet -> TestName -> b -> b
   , foldResource :: forall a . OptionSet -> ResourceSpec a -> (IO a -> b) -> b
   , foldAfter :: OptionSet -> DependencyType -> Expr -> b -> b
+  , foldAfterTree :: OptionSet -> DependencyType -> ExactPath -> b -> b
   }
 
 -- | 'trivialFold' can serve as the basis for custom folds. Just override
@@ -332,6 +362,7 @@ trivialFold = TreeFold
   , foldGroup = \_ _ b -> b
   , foldResource = \_ _ f -> f $ throwIO NotRunningTests
   , foldAfter = \_ _ _ b -> b
+  , foldAfterTree = \_ _ _ b -> b
   }
 
 -- | Fold a test tree into a single value.
@@ -361,24 +392,38 @@ foldTestTree
   -> TestTree
      -- ^ the tree to fold
   -> b
-foldTestTree (TreeFold fTest fGroup fResource fAfter) opts0 tree0 =
+foldTestTree (TreeFold fTest fGroup fResource fAfter fAfterTree) opts0 tree0 =
   go mempty opts0 tree0
   where
-    go :: (Seq.Seq TestName -> OptionSet -> TestTree -> b)
+    go :: ExactPath -> OptionSet -> TestTree -> b
     go path opts tree1 =
       case tree1 of
         SingleTest name test
-          | testPatternMatches pat (path Seq.|> name)
-            -> fTest opts name test
+          | testPatternMatches pat (exactPathToPath (path |> EpcSingleTest name))
+            -> fTest opts (path |> EpcSingleTest name) name test
           | otherwise -> mempty
         TestGroup name trees ->
-          fGroup opts name $ foldMap (go (path Seq.|> name) opts) trees
-        PlusTestOptions f tree -> go path (f opts) tree
-        WithResource res0 tree -> fResource opts res0 $ \res -> go path opts (tree res)
-        AskOptions f -> go path opts (f opts)
-        After deptype dep tree -> fAfter opts deptype dep $ go path opts tree
+          fGroup opts name $ foldMap (goGroup name path opts) (zip [0..] trees)
+        PlusTestOptions f tree -> go (path |> EpcPlusTestOptions) (f opts) tree
+        WithResource res0 tree ->
+          fResource opts res0 $ \res ->
+            go (path |> EpcWithResource) opts (tree res)
+        AskOptions f -> go (path |> EpcAskOptions) opts (f opts)
+        After deptype dep tree ->
+          fAfter opts deptype dep $ go (path |> EpcAfter) opts tree
+        AfterTree deptype treeLeft treeRight ->
+          let
+            pathLeft = path |> EpcAfterTree L
+            pathRight = path |> EpcAfterTree R
+            bLeft = go pathLeft opts treeLeft
+            bRight = go pathRight opts treeRight
+          in
+            bLeft <> fAfterTree opts deptype pathLeft bRight
       where
         pat = lookupOption opts :: TestPattern
+
+    goGroup :: String -> ExactPath -> OptionSet -> (Int, TestTree) -> b
+    goGroup name path opts (n, tree1) = go (path |> EpcTestGroup name n) opts tree1
 
 -- | Get the list of options that are relevant for a given test tree
 treeOptions :: TestTree -> [OptionDescription]
@@ -388,7 +433,7 @@ treeOptions =
   Map.elems .
 
   foldTestTree
-    trivialFold { foldSingle = \_ _ -> getTestOptions }
+    trivialFold { foldSingle = \_ _ _ -> getTestOptions }
     mempty
 
   where
