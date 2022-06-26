@@ -59,6 +59,8 @@ module Test.Tasty
   , DependencyType(..)
   , after
   , after_
+  , afterTree
+  , sequentialTestGroup
   )
   where
 

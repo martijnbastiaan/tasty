@@ -59,6 +59,7 @@ import Data.Typeable
 import Options.Applicative hiding (action, str, Success, Failure)
 import System.IO
 import System.Console.ANSI
+import Test.Tasty.Patterns.Eval (ExactPath)
 #if !MIN_VERSION_base(4,11,0)
 import Data.Foldable (foldMap)
 #endif
@@ -119,8 +120,8 @@ buildTestOutput opts tree =
 
     runSingleTest
       :: (IsTest t, ?colors :: Bool)
-      => OptionSet -> TestName -> t -> Ap (Reader Level) TestOutput
-    runSingleTest _opts name _test = Ap $ do
+      => OptionSet -> ExactPath -> TestName -> t -> Ap (Reader Level) TestOutput
+    runSingleTest _opts _path name _test = Ap $ do
       level <- ask
 
       let
@@ -660,7 +661,7 @@ computeAlignment opts =
   fromMonoid .
   foldTestTree
     trivialFold
-      { foldSingle = \_ name _ level -> Maximum (stringWidth name + level)
+      { foldSingle = \_ _ name _ level -> Maximum (stringWidth name + level)
       , foldGroup = \_opts _ m -> m . (+ indentSize)
       }
     opts
