@@ -68,6 +68,7 @@ library
     base                 >= 4.9 && < 5,
     stm                  >= 2.3,
     containers,
+    dlist                >= 1.0 && < 1.1,
     transformers         >= 0.5,
     tagged               >= 0.5,
     optparse-applicative >= 0.14,

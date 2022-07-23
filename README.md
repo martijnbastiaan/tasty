@@ -759,12 +759,6 @@ tests. The resource may or may not be managed by `withResource`.)
      ]
    ```
 
-Filtering might not behave the way you expect when using dependencies:
-if Test B depends on Test A, remember that either of them may be filtered out
-using the `--pattern` option. Collecting the dependency info happens *after*
-filtering. Therefore, if Test A is filtered out, Test B will run
-unconditionally, and if Test B is filtered out, it simply won't run.
-
 Using patterns to specify dependencies has a few more caveats:
 
 1. Tasty does not currently check whether the pattern in a dependency matches
@@ -788,6 +782,7 @@ Using patterns to specify dependencies has a few more caveats:
    test tree, searching for the next test to execute may also have an
    overhead quadratic in the number of tests.
 
+To avoid these gotchas, consider using `afterTree` or `sequentialTestGroup`.
 
 ## FAQ
 

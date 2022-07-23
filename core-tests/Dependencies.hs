@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE OverloadedLists #-}
 
 module Dependencies (testDependencies) where
@@ -13,6 +14,9 @@ import qualified Data.IntMap as IntMap
 import Control.Monad
 import Control.Exception
 import Data.List (intercalate)
+import Data.Set (Set)
+import qualified Data.Set as Set
+import Utils (runSMap)
 
 testDependencies :: TestTree
 testDependencies = testGroup "Dependencies" $
@@ -20,7 +24,51 @@ testDependencies = testGroup "Dependencies" $
   [circDepShow] ++
   generalExactDependencyTests ++
   circDepTests ++
-  [resourceDependenciesTest]
+  [resourceDependenciesTest] ++
+  [filterTreeTest]
+
+-- | Test tree that looks like:
+--
+--   .
+--   |- A - B
+--   |- C - D - E
+--
+-- I.e., where B depends on A. E depends on D, and D depends on C. Every test will
+-- write their name to the 'MVar'.
+filterTree :: MVar (Set String) -> TestTree
+filterTree mvar = testGroup "Filters"
+  [ afterTree AllSucceed (test "A") (test "B")
+  , sequentialTestGroup "Group" AllSucceed [test "C", test "D", test "E"]
+  ]
+ where
+  test name = testCase name (modVar (Set.insert name))
+  modVar f = modifyMVar_ mvar (pure . f)
+
+-- | Test whether filtering takes dependencies into account.
+filterTreeTest :: TestTree
+filterTreeTest = testGroup "filter test"
+  [ filterTest "A"      ["A"]
+  , filterTest "B"      ["A", "B"]
+  , filterTest "C"      ["C"]
+  , filterTest "D"      ["C", "D"]
+  , filterTest "E"      ["C", "D", "E"]
+  , filterTest "empty"  []
+  ]
+ where
+  filterTest :: String -> Set String -> TestTree
+  filterTest theFilter expected =
+    withResource (newMVar mempty) (const (pure ())) $ \ioMvar -> do
+      testCase theFilter $ do
+        mvar <- ioMvar
+        runTestTree (singleOption (TestPattern (parseExpr theFilter))) (filterTree mvar)
+        actual <- takeMVar mvar
+        expected @=? actual
+
+  runTestTree :: OptionSet -> TestTree -> IO ()
+  runTestTree opts tree = do
+    launchTestTree opts tree $ \smap -> do
+      !_ <- runSMap smap
+      pure (const (pure ()))
 
 -- this is a dummy tree we use for testing
 testTree :: DependencyType -> Bool -> TestTree

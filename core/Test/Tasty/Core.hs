@@ -1,25 +1,63 @@
 -- | Core types and definitions
-{-# LANGUAGE GeneralizedNewtypeDeriving, FlexibleContexts,
-             ExistentialQuantification, RankNTypes, DeriveDataTypeable, NoMonomorphismRestriction,
-             DeriveGeneric #-}
+{-# LANGUAGE FlexibleContexts, ExistentialQuantification, RankNTypes, DeriveDataTypeable,
+             NoMonomorphismRestriction, DeriveGeneric, LambdaCase #-}
 module Test.Tasty.Core where
 
+import qualified Data.DList as DList
+import qualified Data.Foldable as F
+import qualified Data.Map as Map
+import qualified Data.Sequence as Seq
+import qualified Data.Set as Set
+import qualified Test.Tasty.Patterns.Trie as Trie
+
 import Control.Exception
-import Test.Tasty.Providers.ConsoleFormat
+import Control.Monad (guard)
+import Data.DList (DList)
+import Data.Foldable
+import Data.Graph (stronglyConnComp, SCC(CyclicSCC, AcyclicSCC))
+import Data.List (intercalate)
+import Data.Map.Strict (Map)
+import Data.Maybe (maybeToList, mapMaybe)
+import Data.Sequence ((|>))
+import Data.Tagged
+import Data.Typeable
+import GHC.Generics
+import Text.Printf
+
+#if !MIN_VERSION_base(4,11,0)
+import Data.Monoid
+#endif
+
 import Test.Tasty.Options
 import Test.Tasty.Patterns
 import Test.Tasty.Patterns.Eval
 import Test.Tasty.Patterns.Types
-import Data.Foldable
-import Data.Monoid
-import Data.Typeable
-import qualified Data.Map as Map
-import Data.Maybe (maybeToList)
-import Data.Sequence ((|>))
-import Data.Tagged
-import GHC.Generics
-import Prelude  -- Silence AMP and FTP import warnings
-import Text.Printf
+import Test.Tasty.Providers.ConsoleFormat
+
+-- | Maps a test to all its dependencies
+type DependencyTree = Map ExactPath [(DependencyType, ExactPath)]
+
+-- | Specifies how to calculate a dependency
+data DependencySpec
+  = ExactDep ExactPath
+  -- ^ Points to an 'AfterTree' node. That means that the dependencies can be
+  -- fetched by appending @EpcAfterTree L@, and the tests that depend on these
+  -- dependencies by appending @EpcAfterTree R@.
+  | PatternDep Expr ExactPath
+  -- ^ All tests matching this 'Expr' should be considered dependencies of all
+  -- tests matching the 'ExactPath'.
+  deriving (Show, Eq)
+
+-- | Dependency of a test. Either it points to an exact path it depends on, or
+-- contains a pattern that should be tested against all tests in a 'TestTree'.
+data Dependency = Dependency
+  { dpType :: DependencyType
+  , dpSpec :: DependencySpec
+  }
+  deriving (Show, Eq)
+
+-- | Dependencies of a test
+type Deps = [Dependency]
 
 -- | If a test failed, 'FailureReason' describes why
 data FailureReason
@@ -104,6 +142,52 @@ data Result = Result
    failures seems the easiest yet reasonable approach.
 -}
 
+{- Note [Tree folding gotchas]
+   ~~~~~~~~~~~~~~~~~~~~
+   A tree fold reduces a tree to a single value using the functions in
+   'TreeFold'. As the documentation notices, the folder also filters tests based
+   on filter options passed to it (typically passed by the user using the "-p"
+   flag on the command line). While this can seemingly happen in a single pass,
+   let's consider a simple 'TestTree':
+
+       testGroup "tests"
+         [ singleTest "A" aTest
+         , after AllSucceed "A" (singleTest "B" bTest)
+         ]
+
+   Test "B" defines "A" to be a dependency. Therefore, if a user were to filter
+   with "-p B", they would expect "A" to run too. Because patterns can match tests
+   anywhere in the tree, a tree has to be traversed in its entirety _before_ the
+   folder can decide whether or not to exclude a test. Therfore, 'foldTestTree'
+   roughly does the following things:
+
+       1. It builds a 'DependencyTree' by traversing the 'TestTree' without any
+          filters applied.
+
+       2. It builds a list of tests the user wishes to be included just by looking
+          at the pattern supplied.
+
+       3. It combines (1) and (2) and finds all the user specified tests plus their
+          dependencies.
+
+       4. Finally, it uses all the user supplied folding functions, but replaces the
+          filter that tests whether a test is included in the collection constructed
+          in (3).
+
+   To prevent infinite loops while constructing the various collections, the 'TestTree'
+   is checked for cycles - as test patterns can impose them. To keep API compatibility
+   the function throws an exception if it detects cycles. Even though this in some sense
+   violates the function's type signature, it seems like a fair trade-off: we can't do
+   anything useful with test trees containing cycles any way so crashing seems OK.
+
+   Note that this complexity -- the existence of 'Trie', 'DependencyTree', dependency
+   cycles, quadratic test tree construction, and the fact that we need to traverse the
+   tree multiple times for a single fold -- is imposed by the fact that dependencies
+   specified using patterns can match _any_ subtree in the full test tree. We might
+   want to consider deprecating this feature and eventually removing it in favor of
+   'AfterTree'.
+-}
+
 -- | 'True' for a passed test, 'False' for a failed one.
 resultSuccessful :: Result -> Bool
 resultSuccessful r =
@@ -183,6 +267,26 @@ instance Show ResourceError where
     "It looks like you're attempting to use a resource outside of its test. Don't do that!"
 
 instance Exception ResourceError
+
+-- | Exceptions related to dependencies between tests.
+data DependencyException
+  = DependencyLoop [[Path]]
+    -- ^ Test dependencies form cycles. In other words, test A cannot start
+    -- until test B finishes, and test B cannot start until test
+    -- A finishes. Field lists detected cycles.
+  deriving (Typeable)
+
+instance Show DependencyException where
+  show (DependencyLoop css) = "Test dependencies have cycles:\n" ++ showCycles css
+    where
+      showCycles = intercalate "\n" . map showCycle
+      showPath = intercalate "." . Data.Foldable.toList
+
+      -- For clarity in the error message, the first element is repeated at the end
+      showCycle []     = "- <empty cycle>"
+      showCycle (x:xs) = "- " ++ intercalate ", " (map showPath (x:xs ++ [x]))
+
+instance Exception DependencyException
 
 -- | These are the two ways in which one test may depend on the others.
 --
@@ -341,8 +445,9 @@ data TreeFold b = TreeFold
   { foldSingle :: forall t . IsTest t => OptionSet -> ExactPath -> TestName -> t -> b
   , foldGroup :: OptionSet -> TestName -> b -> b
   , foldResource :: forall a . OptionSet -> ResourceSpec a -> (IO a -> b) -> b
-  , foldAfter :: OptionSet -> DependencyType -> Expr -> b -> b
-  , foldAfterTree :: OptionSet -> DependencyType -> ExactPath -> b -> b
+  , foldAfter :: OptionSet -> DependencyType -> ExactPath -> Expr -> b -> b
+  , foldAfterTree :: OptionSet -> DependencyType -> ExactPath-> b -> b
+  , foldFilter :: TestPattern -> ExactPath -> Bool
   }
 
 -- | 'trivialFold' can serve as the basis for custom folds. Just override
@@ -361,9 +466,89 @@ trivialFold = TreeFold
   { foldSingle = \_ _ _ -> mempty
   , foldGroup = \_ _ b -> b
   , foldResource = \_ _ f -> f $ throwIO NotRunningTests
-  , foldAfter = \_ _ _ b -> b
+  , foldAfter = \_ _ _ _ b -> b
   , foldAfterTree = \_ _ _ b -> b
+  , foldFilter = \pat -> testPatternMatches pat . exactPathToPath
   }
+
+-- | Fold a test tree into a single value.
+--
+-- Like 'foldTestTree', but does not take into account dependencies.
+foldTestTreeNoDeps
+  :: forall b . Monoid b
+  => TreeFold b
+     -- ^ the algebra (i.e. how to fold a tree)
+  -> OptionSet
+     -- ^ initial options
+  -> TestTree
+     -- ^ the tree to fold
+  -> b
+foldTestTreeNoDeps (TreeFold fTest fGroup fResource fAfter fAfterTree fFilter) =
+  go mempty
+  where
+    go :: ExactPath -> OptionSet -> TestTree -> b
+    go path opts tree1 =
+      case tree1 of
+        SingleTest name test
+          | fFilter pat (path |> EpcSingleTest name)
+            -> fTest opts (path |> EpcSingleTest name) name test
+          | otherwise -> mempty
+        TestGroup name trees ->
+          fGroup opts name $ foldMap (goGroup name path opts) (zip [0..] trees)
+        PlusTestOptions f tree -> go (path |> EpcPlusTestOptions) (f opts) tree
+        WithResource res0 tree ->
+          fResource opts res0 $ \res ->
+            go (path |> EpcWithResource) opts (tree res)
+        AskOptions f -> go (path |> EpcAskOptions) opts (f opts)
+        After deptype dep tree ->
+          fAfter opts deptype (path |> EpcAfter) dep $ go (path |> EpcAfter) opts tree
+        AfterTree deptype treeLeft treeRight ->
+          let
+            bLeft = go (path |> EpcAfterTree L) opts treeLeft
+            bRight = go (path |> EpcAfterTree R) opts treeRight
+          in
+            bLeft <> fAfterTree opts deptype path bRight
+      where
+        pat = lookupOption opts :: TestPattern
+
+    goGroup :: String -> ExactPath -> OptionSet -> (Int, TestTree) -> b
+    goGroup name path opts (n, tree1) = go (path |> EpcTestGroup name n) opts tree1
+
+-- | Fold a test tree into a single value.
+--
+-- Like 'foldTestTree', but returns 'DependencyTree' it constructed for reuse.
+foldTestTreeWithDeps
+  :: forall b . Monoid b
+  => TreeFold b
+     -- ^ the algebra (i.e. how to fold a tree)
+  -> OptionSet
+     -- ^ initial options
+  -> TestTree
+     -- ^ the tree to fold
+  -> (b, DependencyTree)
+foldTestTreeWithDeps algebra opts testTree =
+  let
+    -- Build a dependency tree based on the _whole_ tree, including tests that would naively
+    -- be filtered by the algebra. Also see [Note: Tree folding gotchas].
+    goFold opt alg = DList.toList (foldTestTreeNoDeps alg opt testTree)
+    allPaths = goFold mempty treePathsFold{foldFilter = \_ _ -> True}
+    allDeps =  goFold mempty treeDependenciesFold{foldFilter = \_ _ -> True}
+    depTree = toDependencyTreeOrThrow allPaths allDeps
+
+    -- Construct a set of all tests that need to be run. These tests consists of all
+    -- tests that would naively be selected, plus all their dependencies.
+    paths = Set.fromList (goFold opts treePathsFold)
+    depPaths = Set.fromList (concatMap (transitiveDependencyPaths depTree) paths)
+
+    -- Construct a new filter that takes into account dependencies.
+    newFoldFilter _pat path = path `Set.member` Set.union paths depPaths
+  in
+    -- 'depTree' might be a 'DependencyLoop' error so we need to make sure it
+    -- gets evaluated, even if the consumer doesn't evaluate it. See
+    -- [Note: tree folding gotchas].
+    depTree `seq`
+      ( foldTestTreeNoDeps algebra{foldFilter=newFoldFilter} opts testTree
+      , depTree )
 
 -- | Fold a test tree into a single value.
 --
@@ -376,13 +561,17 @@ trivialFold = TreeFold
 -- 1. Keeping track of the current options (which may change due to
 -- `PlusTestOptions` nodes)
 --
--- 2. Filtering out the tests which do not match the patterns
+-- 2. Filtering out the tests which do not match the patterns.
 --
 -- Thus, it is preferred to an explicit recursive traversal of the tree.
 --
 -- Note: right now, the patterns are looked up only once, and won't be
 -- affected by the subsequent option changes. This shouldn't be a problem
 -- in practice; OTOH, this behaviour may be changed later.
+--
+-- Note: this function will throw a 'DependencyLoop' exception if cycles are
+-- detected in the 'TestTree'. Use 'foldTestTreeNoDeps' if you don't want folding
+-- to account for dependencies.
 foldTestTree
   :: forall b . Monoid b
   => TreeFold b
@@ -392,38 +581,8 @@ foldTestTree
   -> TestTree
      -- ^ the tree to fold
   -> b
-foldTestTree (TreeFold fTest fGroup fResource fAfter fAfterTree) opts0 tree0 =
-  go mempty opts0 tree0
-  where
-    go :: ExactPath -> OptionSet -> TestTree -> b
-    go path opts tree1 =
-      case tree1 of
-        SingleTest name test
-          | testPatternMatches pat (exactPathToPath (path |> EpcSingleTest name))
-            -> fTest opts (path |> EpcSingleTest name) name test
-          | otherwise -> mempty
-        TestGroup name trees ->
-          fGroup opts name $ foldMap (goGroup name path opts) (zip [0..] trees)
-        PlusTestOptions f tree -> go (path |> EpcPlusTestOptions) (f opts) tree
-        WithResource res0 tree ->
-          fResource opts res0 $ \res ->
-            go (path |> EpcWithResource) opts (tree res)
-        AskOptions f -> go (path |> EpcAskOptions) opts (f opts)
-        After deptype dep tree ->
-          fAfter opts deptype dep $ go (path |> EpcAfter) opts tree
-        AfterTree deptype treeLeft treeRight ->
-          let
-            pathLeft = path |> EpcAfterTree L
-            pathRight = path |> EpcAfterTree R
-            bLeft = go pathLeft opts treeLeft
-            bRight = go pathRight opts treeRight
-          in
-            bLeft <> fAfterTree opts deptype pathLeft bRight
-      where
-        pat = lookupOption opts :: TestPattern
-
-    goGroup :: String -> ExactPath -> OptionSet -> (Int, TestTree) -> b
-    goGroup name path opts (n, tree1) = go (path |> EpcTestGroup name n) opts tree1
+foldTestTree algebra opts testTree =
+  fst (foldTestTreeWithDeps algebra opts testTree)
 
 -- | Get the list of options that are relevant for a given test tree
 treeOptions :: TestTree -> [OptionDescription]
@@ -443,3 +602,115 @@ treeOptions =
     getTestOptions t =
       Map.singleton (typeOf t) $
           witness testOptions t
+
+-- | Get all paths in a 'TestTree', potentially filtered by options given in
+-- the first argument, 'OptionSet'.
+treePathsFold :: TreeFold (DList ExactPath)
+treePathsFold = trivialFold{foldSingle = \_ path _ _ -> DList.singleton path}
+
+-- | Get all dependencies stored in a 'TestTree'.
+treeDependenciesFold :: TreeFold (DList Dependency)
+treeDependenciesFold = trivialFold{foldAfter=goAfter, foldAfterTree=goAfterTree}
+ where
+  goAfterTree _ depType path deps =
+    Dependency depType (ExactDep path) `DList.cons` deps
+
+  goAfter _ depType path expr deps =
+    Dependency depType (PatternDep expr path) `DList.cons` deps
+
+-- | Fetch all dependencies (and theirs, and so on) for a given test.
+transitiveDependencies :: DependencyTree -> ExactPath -> [(DependencyType, ExactPath)]
+transitiveDependencies depTree = go
+ where
+  go :: ExactPath -> [(DependencyType, ExactPath)]
+  go p =
+    case Map.lookup p depTree of
+      Nothing -> []
+      Just depsAndPaths ->
+        depsAndPaths <> concatMap (go . snd) depsAndPaths
+
+-- | Fetch all dependencies (and theirs, and so on) for a given test.
+transitiveDependencyPaths :: DependencyTree -> ExactPath -> [ExactPath]
+transitiveDependencyPaths tree = map snd . transitiveDependencies tree
+
+-- | Construct a 'DependencyTree' from a given tree, or fail with an exception
+-- if the test contained cycles.
+toDependencyTreeOrThrow
+  :: [ExactPath]
+  -- ^ All paths in the tree.
+  -> [Dependency]
+  -- ^ All dependencies in the tree.
+  -> DependencyTree
+  -- ^ Returns the constructued 'DependencyTree' or throws if the tree contains cycles.
+toDependencyTreeOrThrow allPaths deps =
+  either
+    (throw . DependencyLoop . map (map exactPathToPath))
+    id
+    (toDependencyTree allPaths deps)
+
+-- | Construct a 'DependencyTree' from a given tree.
+toDependencyTree
+  :: [ExactPath]
+  -- ^ All paths in the tree.
+  -> [Dependency]
+  -- ^ All dependencies in the tree.
+  -> Either [[ExactPath]] DependencyTree
+  -- ^ Returns the constructued 'DependencyTree' or a list of all cycles found
+  -- within it.
+toDependencyTree allPaths deps =
+  case checkCycles depTree of
+    Nothing -> Right depTree
+    Just cycles -> Left cycles
+
+ where
+  depTree = foldl' insert mempty (concatMap go deps)
+  insert tree (test, dep) =  Map.alter (Just . maybe [dep] (dep:)) test tree
+
+  go :: Dependency -> [(ExactPath, (DependencyType, ExactPath))]
+  go (Dependency depType depSpec) = case depSpec of
+    ExactDep path -> do
+      -- Filter any dependencies that are part of the _left_ side of an
+      -- 'AfterTree'. All tests in the _right_ tree depend on them to
+      -- finish anyway, so no need to wait pollute the dependency list
+      -- with them.
+      (depPath, ()) <- Trie.matchPrefix trie (path |> EpcAfterTree L)
+      let subDepPath = Seq.drop (length depPath) depPath
+      -- TODO: Build into Trie for more efficient filtering
+      guard $ F.notElem (EpcAfterTree L) subDepPath
+
+      -- Filter any tests that are part of the _right_ side of an
+      -- 'AfterTree'.
+      (testPath, ()) <- Trie.matchPrefix trie (path |> EpcAfterTree R)
+      let subTestPath = Seq.drop (length testPath) testPath
+      -- TODO: Build into Trie for more efficient filtering
+      guard $ F.notElem (EpcAfterTree R) subTestPath
+
+      pure (testPath, (depType, depPath))
+
+    -- Note: Duplicate dependencies may arise if the same test name matches
+    -- multiple patterns. It's not clear that removing them is worth the
+    -- trouble; might consider this in the future.
+    PatternDep depexpr testPrefix -> do
+      -- Consider each test in the whole test tree, and filter the ones
+      -- that match 'depexpr'.
+      depPath <- allPaths
+      (testPath, ()) <- Trie.matchPrefix trie testPrefix
+      guard $ exprMatches depexpr (exactPathToPath depPath)
+      pure (testPath, (depType, depPath))
+
+  trie = Trie.fromList (zip allPaths (repeat ()))
+
+-- | Check whether a 'DependencyTree' contains cycles. If it does, return the
+-- tests that formed cycles.
+checkCycles :: DependencyTree -> Maybe [[ExactPath]]
+checkCycles tests = do
+  case cycles of
+    [] -> Nothing
+    _  -> Just cycles
+ where
+  graph = [(v, v, map snd vs) | (v, vs) <- Map.toList tests]
+  sccs = stronglyConnComp graph
+  cycles =
+    flip mapMaybe sccs $ \case
+      AcyclicSCC{} -> Nothing
+      CyclicSCC vs -> Just vs
