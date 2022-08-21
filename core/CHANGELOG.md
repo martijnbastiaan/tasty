@@ -6,7 +6,8 @@ Unreleased
 
 _YYYY-MM-DD_
 
-* Dependency loop error now lists all test cases that formed a cycle
+* Dependency loop error now lists all test cases that formed a cycle (#340)
+* Dependencies can now be defined pattern-free with `sequentialTestGroup` (#343)
 
 Version 1.4.3
 ---------------

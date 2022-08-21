@@ -37,4 +37,5 @@ data Expr
   ( Show
   , Eq      -- ^ @since 1.1
   , Generic -- ^ @since 1.4.2
+  , Ord     -- ^ @since 1.5.0
   )
