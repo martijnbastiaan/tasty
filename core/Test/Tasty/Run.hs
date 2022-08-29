@@ -23,6 +23,7 @@ import Data.Int (Int64)
 import Data.List (intercalate, mapAccumL)
 import Data.Maybe
 import Data.Monoid (First(..))
+import Data.Semigroup (Any(..))
 import Data.Sequence (Seq, (|>), (<|))
 import Data.Typeable
 import GHC.Conc (labelThread)
@@ -312,7 +313,7 @@ createTestActions opts0 tree0 = do
         statusVar <- liftIO (newTVarIO NotStarted)
         let act = uncurry (executeTest (run opts test) statusVar (lookupOption opts))
         pure
-          ( Matched True
+          ( Any True
           , ( pure (TestAction testPath act statusVar deps)
             , mempty
             )

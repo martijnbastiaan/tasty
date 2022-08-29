@@ -10,7 +10,6 @@ import Data.Coerce (coerce)
 import Data.Foldable
 import Data.List (mapAccumL)
 import Data.Monoid
-import qualified Data.Semigroup as Sem
 import Data.Tagged
 import Data.Typeable
 import GHC.Generics
@@ -349,16 +348,7 @@ trivialFold = TreeFold
   , foldAfter = \_ _ _ b -> b
   }
 
-newtype Matched = Matched Bool
-
-instance Sem.Semigroup Matched where
-  (<>) = coerce (||)
-
-instance Monoid Matched where
-  mempty = Matched False
-#if !MIN_VERSION_base(4,11,0)
-  mappend = (Sem.<>)
-#endif
+type Matched = Any
 
 -- | Fold a test tree into a single value.
 --
@@ -395,7 +385,7 @@ foldTestTree (TreeFold fTest fGroup fAfter) opts0 tree0 =
       case tree1 of
         SingleTest name test
           | coerce matched || testPatternMatches pat (path Seq.|> name)
-            -> (Matched True, fTest opts name test)
+            -> (Any True, fTest opts name test)
           | otherwise -> mempty
         TestGroup Parallel name trees ->
           second
