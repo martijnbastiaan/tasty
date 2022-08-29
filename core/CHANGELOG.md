@@ -7,7 +7,7 @@ Unreleased
 _YYYY-MM-DD_
 
 * Dependency loop error now lists all test cases that formed a cycle (#340)
-* Dependencies can now be defined pattern-free with `sequentialTestGroup` (#343)
+* Dependencies can now be defined pattern-free with `sequentialTestGroup`. As a consequence, `TestGroup` now has an additional field `ExecutionMode`, specifying whether a test group should run in parallel or sequentially. `TreeFold` no longer has a field `foldResource` to accommodate test filters in combination with dependencies specified using `sequentialTestGroup`. (#343)
 
 Version 1.4.3
 ---------------
