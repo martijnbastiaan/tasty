@@ -378,7 +378,7 @@ createTestActions opts0 tree0 = do
     actions1 = fmap updateDepends actions0
 
     updateDepends a@TestAction{testDepends} =
-      a{testDepends=deps0 <> testDepends}
+      a { testDepends=deps0 <> testDepends }
 
     deps1
       -- If this test tree is empty (either due to it being actually empty, or due
