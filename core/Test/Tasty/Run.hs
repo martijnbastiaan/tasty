@@ -300,9 +300,9 @@ createTestActions opts0 tree0 = do
     :: Seq TestName
     -> OptionSet
     -> Seq Dependency
-    -> Matched
+    -> ForceMatched
     -> TestTree
-    -> IO (Matched, (Seq (TestAction Dependency), Seq Finalizer))
+    -> IO (TestMatched, (Seq (TestAction Dependency), Seq Finalizer))
   go path opts deps forceFilter = \case
     SingleTest testName test -> do
       let

@@ -8,7 +8,7 @@ import Control.Exception
 import Data.Bifunctor (second)
 import Data.Coerce (coerce)
 import Data.Foldable
-import Data.List (mapAccumL)
+import Data.List (mapAccumR)
 import Data.Monoid
 import Data.Tagged
 import Data.Typeable
@@ -348,7 +348,8 @@ trivialFold = TreeFold
   , foldAfter = \_ _ _ b -> b
   }
 
-type Matched = Any
+type TestMatched = Any
+type ForceMatched = Any
 
 -- | Fold a test tree into a single value.
 --
@@ -380,30 +381,54 @@ foldTestTree
 foldTestTree (TreeFold fTest fGroup fAfter) opts0 tree0 =
   snd (go mempty opts0 mempty tree0)
   where
-    go :: Seq.Seq TestName -> OptionSet -> Matched -> TestTree -> (Matched, b)
-    go path opts matched tree1 =
+    go
+      :: Seq.Seq TestName
+      -> OptionSet
+
+      -- Whether to force tests in this tree to run, even though they would
+      -- normally be filtered out by a pattern. This is used to force dependencies
+      -- to run. Also see the documentation of this function's result.
+      -> ForceMatched
+
+      -- Tree to fold
+      -> TestTree
+
+      -- Returns the monoid structure and a boolean indicating whether any test
+      -- was matched in the processed tree (in the 'SingleTest' branch). This
+      -- is used to force dependencies of the particiular tree to run.
+      -> (TestMatched, b)
+    go path opts forceMatched tree1 =
       case tree1 of
-        SingleTest name test
-          | coerce matched || testPatternMatches pat (path Seq.|> name)
-            -> (Any True, fTest opts name test)
-          | otherwise -> mempty
+        SingleTest name test ->
+          foldSingleTest name test
+
         TestGroup Parallel name trees ->
           second
             (fGroup opts name)
-            (foldMap (go (path Seq.|> name) opts matched) trees)
+            (foldMap (go (path Seq.|> name) opts forceMatched) trees)
+
         TestGroup (Sequential _) name trees ->
           second
-            (fGroup opts name . mconcat . reverse)
-            (mapAccumL (go (path Seq.|> name) opts) matched (reverse trees))
-        PlusTestOptions f tree -> go path (f opts) matched tree
-        WithResource (ResourceSpec res _) tree -> go path opts matched (tree res)
-        AskOptions f -> go path opts matched (f opts)
+            (fGroup opts name . mconcat)
+            (mapAccumR (go (path Seq.|> name) opts) forceMatched trees)
+
+        PlusTestOptions f tree -> go path (f opts) forceMatched tree
+        WithResource (ResourceSpec res _) tree -> go path opts forceMatched (tree res)
+        AskOptions f -> go path opts forceMatched (f opts)
+
         After deptype dep tree ->
           second
             (fAfter opts deptype dep)
-            (go path opts matched tree)
+            (go path opts forceMatched tree)
       where
         pat = lookupOption opts :: TestPattern
+
+        foldSingleTest :: IsTest a => TestName -> a -> (Any, b)
+        foldSingleTest name test =
+          if coerce forceMatched || testPatternMatches pat (path Seq.|> name) then
+            (Any True, fTest opts name test)
+          else
+            mempty
 
 -- | Get the list of options that are relevant for a given test tree
 treeOptions :: TestTree -> [OptionDescription]
