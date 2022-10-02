@@ -7,7 +7,6 @@ module Test.Tasty.Core where
 import Control.Exception
 import Data.Bifunctor (second)
 import Data.Coerce (coerce)
-import Data.Foldable
 import Data.List (mapAccumR)
 import Data.Monoid
 import Data.Tagged
@@ -16,6 +15,7 @@ import GHC.Generics
 import Prelude  -- Silence AMP and FTP import warnings
 import qualified Data.Map as Map
 import qualified Data.Sequence as Seq
+import Data.Sequence (Seq)
 import Test.Tasty.Options
 import Test.Tasty.Patterns
 import Test.Tasty.Patterns.Types
@@ -325,8 +325,9 @@ after deptype s =
 -- instead. This way your code won't break when new nodes/fields are
 -- indroduced.
 data TreeFold b = TreeFold
-  { foldSingle :: forall t . IsTest t => OptionSet -> TestName -> t -> b
-  , foldGroup :: OptionSet -> TestName -> b -> b
+  { foldSingle :: forall t . IsTest t => OptionSet -> Seq TestName -> TestName -> t -> b
+  , foldGroup :: OptionSet -> TestName -> ExecutionMode -> [b] -> b
+  , foldResource :: forall a . OptionSet -> ResourceSpec a -> (IO a -> (TestMatched, b)) -> (TestMatched, b)
   , foldAfter :: OptionSet -> DependencyType -> Expr -> b -> b
   }
 
@@ -344,7 +345,8 @@ data TreeFold b = TreeFold
 trivialFold :: Monoid b => TreeFold b
 trivialFold = TreeFold
   { foldSingle = \_ _ _ -> mempty
-  , foldGroup = \_ _ b -> b
+  , foldGroup = \_ _ _ b -> mconcat b
+  , foldResource = \_ _ f -> f $ throwIO NotRunningTests
   , foldAfter = \_ _ _ b -> b
   }
 
@@ -375,7 +377,7 @@ foldTestTree
   -> TestTree
      -- ^ the tree to fold
   -> b
-foldTestTree (TreeFold fTest fGroup fAfter) opts0 tree0 =
+foldTestTree (TreeFold fTest fGroup fResource fAfter) opts0 tree0 =
   snd (go mempty opts0 mempty tree0)
   where
     go
@@ -392,25 +394,30 @@ foldTestTree (TreeFold fTest fGroup fAfter) opts0 tree0 =
 
       -- Returns the monoid structure and a boolean indicating whether any test
       -- was matched in the processed tree (in the 'SingleTest' branch). This
-      -- is used to force dependencies of the particiular tree to run.
+      -- is used to force dependencies of the particular tree to run.
       -> (TestMatched, b)
     go path opts forceMatched tree1 =
       case tree1 of
         SingleTest name test ->
           foldSingleTest name test
 
-        TestGroup Parallel name trees ->
-          second
-            (fGroup opts name)
-            (foldMap (go (path Seq.|> name) opts forceMatched) trees)
+        TestGroup execMode@Parallel name trees ->
+          let
+            go' = go (path Seq.|> name) opts forceMatched
+            (testMatcheds, bs) = unzip (map go' trees)
+          in
+            ( mconcat testMatcheds
+            , fGroup opts name execMode bs )
 
-        TestGroup (Sequential _) name trees ->
+        TestGroup execMode@(Sequential _) name trees ->
           second
-            (fGroup opts name . mconcat)
+            (fGroup opts name execMode)
             (mapAccumR (go (path Seq.|> name) opts) forceMatched trees)
 
         PlusTestOptions f tree -> go path (f opts) forceMatched tree
-        WithResource (ResourceSpec res _) tree -> go path opts forceMatched (tree res)
+        WithResource res0 tree ->
+          fResource opts res0 $ \res1 ->
+            go path opts forceMatched (tree res1)
         AskOptions f -> go path opts forceMatched (f opts)
 
         After deptype dep tree ->
@@ -423,7 +430,7 @@ foldTestTree (TreeFold fTest fGroup fAfter) opts0 tree0 =
         foldSingleTest :: IsTest a => TestName -> a -> (Any, b)
         foldSingleTest name test =
           if coerce forceMatched || testPatternMatches pat (path Seq.|> name) then
-            (Any True, fTest opts name test)
+            (Any True, fTest opts (path Seq.|> name) name test)
           else
             mempty
 
@@ -435,7 +442,7 @@ treeOptions =
   Map.elems .
 
   foldTestTree
-    trivialFold { foldSingle = \_ _ -> getTestOptions }
+    trivialFold { foldSingle = \_ _ _ -> getTestOptions }
     mempty
 
   where

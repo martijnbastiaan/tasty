@@ -59,6 +59,7 @@ import Data.Typeable
 import Options.Applicative hiding (action, str, Success, Failure)
 import System.IO
 import System.Console.ANSI
+import Data.Sequence (Seq)
 #if !MIN_VERSION_base(4,11,0)
 import Data.Foldable (foldMap)
 #endif
@@ -119,8 +120,8 @@ buildTestOutput opts tree =
 
     runSingleTest
       :: (IsTest t, ?colors :: Bool)
-      => OptionSet -> TestName -> t -> Ap (Reader Level) TestOutput
-    runSingleTest _opts name _test = Ap $ do
+      => OptionSet -> Seq TestName -> TestName -> t -> Ap (Reader Level) TestOutput
+    runSingleTest _opts _path name _test = Ap $ do
       level <- ask
 
       let
@@ -154,12 +155,17 @@ buildTestOutput opts tree =
 
       return $ PrintTest name printTestName printTestResult
 
-    runGroup :: OptionSet -> TestName -> Ap (Reader Level) TestOutput -> Ap (Reader Level) TestOutput
-    runGroup _opts name grp = Ap $ do
+    runGroup
+      :: OptionSet
+      -> TestName
+      -> ExecutionMode
+      -> [Ap (Reader Level) TestOutput]
+      -> Ap (Reader Level) TestOutput
+    runGroup _opts name _execMode grp = Ap $ do
       level <- ask
       let
         printHeading = printf "%s%s\n" (indent level) name
-        printBody = runReader (getApp grp) (level + 1)
+        printBody = runReader (getApp (mconcat grp)) (level + 1)
       return $ PrintHeading name printHeading printBody
 
   in
@@ -660,8 +666,8 @@ computeAlignment opts =
   fromMonoid .
   foldTestTree
     trivialFold
-      { foldSingle = \_ name _ level -> Maximum (stringWidth name + level)
-      , foldGroup = \_opts _ m -> m . (+ indentSize)
+      { foldSingle = \_ _ name _ level -> Maximum (stringWidth name + level)
+      , foldGroup = \_opts _ _ m -> mconcat m . (+ indentSize)
       }
     opts
   where

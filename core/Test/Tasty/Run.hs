@@ -2,6 +2,7 @@
 {-# LANGUAGE ScopedTypeVariables, ExistentialQuantification, RankNTypes,
              FlexibleContexts, CPP, DeriveDataTypeable, RecordWildCards,
              LambdaCase, TupleSections, NamedFieldPuns #-}
+{-# LANGUAGE TypeApplications #-}
 module Test.Tasty.Run
   ( Status(..)
   , StatusMap
@@ -13,14 +14,14 @@ import Control.Concurrent
 import Control.Concurrent.Async
 import Control.Concurrent.STM
 import Control.Exception as E
-import Control.Monad (forever, guard, join, liftM)
+import Control.Monad (forever, guard, join, liftM, forM)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Writer (execWriterT, tell)
 import Data.Bifunctor (second)
 import Data.Coerce (coerce)
 import Data.Graph (SCC(..), stronglyConnComp)
 import Data.Int (Int64)
-import Data.List (intercalate, mapAccumL)
+import Data.List (intercalate, mapAccumL, mapAccumR)
 import Data.Maybe
 import Data.Monoid (First(..))
 import Data.Semigroup (Any(..))
@@ -28,14 +29,6 @@ import Data.Sequence (Seq, (|>), (<|))
 import Data.Typeable
 import GHC.Conc (labelThread)
 import System.Timeout (timeout)
-
-#if MIN_VERSION_base(4,18,0)
-import Data.Traversable (mapAccumM)
-#endif
-
-#if !MIN_VERSION_base(4,11,0)
-import Data.Monoid ((<>))
-#endif
 
 import qualified Data.Sequence as Seq
 import qualified Data.Foldable as F
@@ -270,7 +263,9 @@ data TestAction dep = TestAction
   , testDepends :: Seq dep
   }
 
-#if !MIN_VERSION_base(4,18,0)
+addDependencies :: Seq dep -> TestAction dep -> TestAction dep
+addDependencies deps a@TestAction{testDepends} = a { testDepends = deps <> testDepends }
+
 -- Behaves like a combination of fmap and foldl; it applies a function to each
 -- element of a structure, passing an accumulating parameter from left to right,
 -- and returning a final value of this accumulator together with the new
@@ -281,7 +276,8 @@ mapAccumM f acc (x:xs) = do
   (acc', y) <- f acc x
   (acc'', ys) <- mapAccumM f acc' xs
   return (acc'', y:ys)
-#endif
+
+type Tr = (Seq (TestAction Dependency), Seq Finalizer)
 
 -- | Turn a test tree into a list of actions to run tests coupled with
 -- variables to watch them.
@@ -290,100 +286,80 @@ createTestActions
   -> TestTree
   -> IO ([(Action, TVar Status)], Seq Finalizer)
 createTestActions opts0 tree0 = do
-  (_, (tests0, fins)) <- go mempty opts0 mempty mempty tree0
+  (tests0, fins) <- foldTestTree folder opts0 tree0
   tests1 <- case resolveDeps (F.toList tests0) of
     Left cycles -> throwIO (DependencyLoop cycles)
     Right ts -> pure ts
   pure (tests1, fins)
  where
-  go
-    :: Seq TestName
-    -> OptionSet
-    -> Seq Dependency
-    -> ForceMatched
-    -> TestTree
-    -> IO (TestMatched, (Seq (TestAction Dependency), Seq Finalizer))
-  go path opts deps forceFilter = \case
-    SingleTest testName test -> do
-      let
-        testPath = path |> testName
-        pat = lookupOption opts :: TestPattern
+  folder :: TreeFold (IO Tr)
+  folder = (trivialFold @(IO Tr))
+    { foldSingle = goSingle
+    , foldGroup = goGroup
+    , foldResource = goResource
+    , foldAfter = goAfter
+    }
 
-      if coerce forceFilter || testPatternMatches pat testPath then do
-        statusVar <- liftIO (newTVarIO NotStarted)
-        let act = uncurry (executeTest (run opts test) statusVar (lookupOption opts))
-        pure
-          ( Any True
-          , ( pure (TestAction testPath act statusVar deps)
-            , mempty
-            )
-          )
-      else
-        pure mempty
+  goSingle :: IsTest t =>  OptionSet -> Seq TestName -> TestName -> t -> IO Tr
+  goSingle opts testPath _testName test = do
+    statusVar <- liftIO (newTVarIO NotStarted)
+    let act = uncurry (executeTest (run opts test) statusVar (lookupOption opts))
+    pure (Seq.singleton (TestAction testPath act statusVar mempty), mempty)
 
-    TestGroup Parallel testName testTrees ->
-      mconcat <$> mapM (go (path |> testName) opts deps forceFilter) testTrees
+  goGroup :: OptionSet -> TestName -> ExecutionMode -> [IO Tr] -> IO Tr
+  goGroup _opts _name = \case
+    Parallel -> mconcat
+    Sequential depType ->
+        fmap (mconcat . reverse . snd)
+      . mapAccumM (goSequentialGroup depType) mempty
+      . reverse
 
-    TestGroup (Sequential depType) testName testTrees ->
-      fmap
-        -- Add all tests of /nth/ tree to the dependencies of /(n+1)th/ tree
-        (second (mconcat . snd . mapAccumL (goSeqGroup depType) deps . reverse))
-
-        -- If a test is selected for running, make sure all its dependencies
-        -- run too by setting the 'forceFilter' argument.
-        (mapAccumM
-          (go (path |> testName) opts mempty)
-          forceFilter
-          (reverse testTrees))
-
-    PlusTestOptions f tree ->
-      go path (f opts) deps forceFilter tree
-
-    WithResource (ResourceSpec doInit doRelease) fTree -> do
-      initVar <- newTVarIO NotCreated
-      (forceFilter1, (tests, fins)) <- go path opts deps forceFilter (fTree (getResource initVar))
-      -- The resource will get cleaned up after all the tests in 'tests' have
-      -- run. This is tracked by counting down to zero in 'finishVar'. This
-      -- counting happens in executeTest's 'destroyResources'.
-      finishVar <- newTVarIO (length tests)
-      let
-        ini = Initializer doInit initVar
-        fin = Finalizer doRelease initVar finishVar
-      pure (forceFilter1, (goResource ini fin <$> tests, fins |> fin))
-
-    AskOptions f ->
-      go path opts deps forceFilter (f opts)
-
-    After depType expr tree ->
-      let dep = Dependency depType (PatternDep expr)
-       in go path opts (deps |> dep) forceFilter tree
-
-  goSeqGroup
-    :: DependencyType
-    -> Seq Dependency
-    -> (Seq (TestAction Dependency), Seq Finalizer)
-    -> (Seq Dependency, (Seq (TestAction Dependency), Seq Finalizer))
-  goSeqGroup depType deps0 (actions0, finalizers) = do
-    (deps1, (actions1, finalizers))
+  goSequentialGroup :: DependencyType -> Seq Dependency -> IO Tr -> IO (Seq Dependency, Tr)
+  goSequentialGroup depType deps0 tr = do
+    (actions0, finalizers) <- tr
+    let
+      deps1 = goDeps actions0
+      actions1 = fmap (addDependencies deps0) actions0
+    pure (deps1, (actions1, finalizers))
    where
-    actions1 = fmap updateDepends actions0
-
-    updateDepends a@TestAction{testDepends} =
-      a { testDepends=deps0 <> testDepends }
-
-    deps1
+    goDeps actions
       -- If this test tree is empty (either due to it being actually empty, or due
       -- to all tests being filtered) we need to propagate the previous dependencies.
-      | Seq.null actions0 = deps0
-      | otherwise = flip fmap actions0 $ \TestAction{..} ->
+      | Seq.null actions = deps0
+      | otherwise = flip fmap actions $ \TestAction{..} ->
           Dependency depType $ ExactDep testPath testStatus
 
   goResource
+    :: forall a
+     . OptionSet
+    -> ResourceSpec a
+    -> (IO a -> (TestMatched, IO Tr))
+    -> (TestMatched, IO Tr)
+  goResource _opts (ResourceSpec doInit doRelease) fTree = do
+    initVar <- newTVarIO NotCreated
+    let (forceFilter1, ioTr) = fTree (getResource initVar)
+    (tests, fins) <- ioTr
+    -- The resource will get cleaned up after all the tests in 'tests' have
+    -- run. This is tracked by counting down to zero in 'finishVar'. This
+    -- counting happens in executeTest's 'destroyResources'.
+    finishVar <- newTVarIO (length tests)
+    let
+      ini = Initializer doInit initVar
+      fin = Finalizer doRelease initVar finishVar
+    return (forceFilter1, return (addInitFin ini fin <$> tests, fins |> fin))
+
+  goAfter :: OptionSet -> DependencyType -> Expr -> IO Tr -> IO Tr
+  goAfter _opts depType expr tr = do
+    (actions, finalizers) <- tr
+    let dep = Dependency depType (PatternDep expr)
+    pure (addDependencies (pure dep) <$> actions, finalizers)
+
+  addInitFin
     :: Initializer
     -> Finalizer
     -> TestAction Dependency
     -> TestAction Dependency
-  goResource ini fin action@TestAction{..} = action{testAction =
+  addInitFin ini fin action@TestAction{..} = action{testAction =
     \(inits, fins) -> testAction (inits |> ini, fin <| fins)
   }
 

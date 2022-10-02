@@ -68,8 +68,8 @@ getTestNames :: OptionSet -> TestTree -> [String]
 getTestNames =
   foldTestTree
     trivialFold
-      { foldSingle = \_ name _ -> [name]
-      , foldGroup = \_opts n l -> map ((n ++ ".") ++) l
+      { foldSingle = \_ _ name _ -> [name]
+      , foldGroup = \_opts n _e l -> map ((n ++ ".") ++) (mconcat l)
       }
 
 -- the tree being tested
