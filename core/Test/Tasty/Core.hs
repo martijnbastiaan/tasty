@@ -392,7 +392,15 @@ trivialFold = TreeFold
   , foldAfter = \_ _ _ b -> b
   }
 
-type Matched = Any
+-- | Indicates whether a test matched in an evaluated subtree. If no filter was
+-- used, tests always match.
+type TestMatched = Any
+
+-- | Used to force tests to be included, even if they would be filtered out by
+-- a user's filter. This is used to force dependencies of a test to run. For
+-- example, if test @A@ depends on test @B@ and test @A@ is selected to run, test
+-- @B@ will be forced to match.
+type ForceTestMatch = Any
 
 -- | Fold a test tree into a single value.
 --
@@ -426,28 +434,28 @@ foldTestTree
 foldTestTree (TreeFold fTest fGroup fAfter) opts0 tree0 =
   snd (go mempty opts0 mempty tree0)
   where
-    go :: Seq.Seq TestName -> OptionSet -> Matched -> TestTree -> (Matched, b)
-    go path opts matched tree1 =
+    go :: Seq.Seq TestName -> OptionSet -> ForceTestMatch -> TestTree -> (TestMatched, b)
+    go path opts forceMatch tree1 =
       case tree1 of
         SingleTest name test
-          | coerce matched || testPatternMatches pat (path Seq.|> name)
+          | coerce forceMatch || testPatternMatches pat (path Seq.|> name)
             -> (Any True, fTest opts name test)
           | otherwise -> mempty
         TestGroup Parallel name trees ->
           second
             (fGroup opts name)
-            (foldMap (go (path Seq.|> name) opts matched) trees)
+            (foldMap (go (path Seq.|> name) opts forceMatch) trees)
         TestGroup (Sequential _) name trees ->
           second
             (fGroup opts name . mconcat . reverse)
-            (mapAccumL (go (path Seq.|> name) opts) matched (reverse trees))
-        PlusTestOptions f tree -> go path (f opts) matched tree
-        WithResource (ResourceSpec res _) tree -> go path opts matched (tree res)
-        AskOptions f -> go path opts matched (f opts)
+            (mapAccumL (go (path Seq.|> name) opts) forceMatch (reverse trees))
+        PlusTestOptions f tree -> go path (f opts) forceMatch tree
+        WithResource (ResourceSpec res _) tree -> go path opts forceMatch (tree res)
+        AskOptions f -> go path opts forceMatch (f opts)
         After deptype dep tree ->
           second
             (fAfter opts deptype dep)
-            (go path opts matched tree)
+            (go path opts forceMatch tree)
       where
         pat = lookupOption opts :: TestPattern
 
