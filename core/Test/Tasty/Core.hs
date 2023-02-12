@@ -8,7 +8,7 @@ import Control.Exception
 import Data.Bifunctor (second)
 import Data.Coerce (coerce)
 import Data.Foldable
-import Data.List (mapAccumL, mapAccumR)
+import Data.List (mapAccumR)
 import Data.Monoid
 import Data.Tagged
 import Data.Typeable
@@ -361,7 +361,7 @@ after deptype s =
 --
 -- Instead of constructing fresh records, build upon `trivialFold`
 -- instead. This way your code won't break when new nodes/fields are
--- indroduced.
+-- introduced.
 --
 -- @since 0.7
 data TreeFold b = TreeFold
@@ -437,18 +437,34 @@ foldTestTree (TreeFold fTest fGroup fAfter) opts0 tree0 =
     go :: Seq.Seq TestName -> OptionSet -> ForceTestMatch -> TestTree -> (TestMatched, b)
     go path opts forceMatch tree1 =
       case tree1 of
+        -- A test can either be forced to run by the 'ForceTestMatch' argument (see
+        -- documentation of 'ForceTestMatch') or by a user filter. Note that if the
+        -- filter is empty, it will trivially match. Whether or not a test matched
+        -- is part of the return value. This information is used in 'TestGroup's
+        -- 'Sequential' branch.
         SingleTest name test
           | coerce forceMatch || testPatternMatches pat (path Seq.|> name)
             -> (Any True, fTest opts name test)
           | otherwise -> mempty
+
+        -- Note that any test matched in the parallel test group results in a
+        -- matched test returned here, thanks to the Monoid implementation of
+        -- 'TestMatched'.
         TestGroup Parallel name trees ->
           second
             (fGroup opts name)
             (foldMap (go (path Seq.|> name) opts forceMatch) trees)
+
+        -- Unlike parallel test groups, sequential test groups start processing
+        -- at the last element of 'trees', working their way towards the initial
+        -- one while accumulating a 'ForceTestMatch'/'TestMatched' value. That is,
+        -- if any test towards the end has to run, any test towards the beginning
+        -- has to too. Also see documentation of 'ForceTestMatch'.
         TestGroup (Sequential _) name trees ->
           second
             (fGroup opts name . mconcat)
             (mapAccumR (go (path Seq.|> name) opts) forceMatch trees)
+
         PlusTestOptions f tree -> go path (f opts) forceMatch tree
         WithResource (ResourceSpec res _) tree -> go path opts forceMatch (tree res)
         AskOptions f -> go path opts forceMatch (f opts)
