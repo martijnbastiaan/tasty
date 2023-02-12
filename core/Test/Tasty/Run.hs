@@ -29,10 +29,6 @@ import Data.Typeable
 import GHC.Conc (labelThread)
 import System.Timeout (timeout)
 
-#if MIN_VERSION_base(4,18,0)
-import Data.Traversable (mapAccumM)
-#endif
-
 #if !MIN_VERSION_base(4,11,0)
 import Data.Monoid ((<>))
 #endif
@@ -280,18 +276,16 @@ data TestAction dep = TestAction
   , testDepends :: Seq dep
   }
 
-#if !MIN_VERSION_base(4,18,0)
--- Behaves like a combination of fmap and foldl; it applies a function to each
--- element of a structure, passing an accumulating parameter from left to right,
--- and returning a final value of this accumulator together with the new
--- structure. Monadic version of 'mapAccumL'.
-mapAccumM :: Monad m => (acc -> x -> m (acc, y)) -> acc -> [x] -> m (acc, [y])
-mapAccumM _ acc [] = return (acc, [])
-mapAccumM f acc (x:xs) = do
-  (acc', y) <- f acc x
-  (acc'', ys) <- mapAccumM f acc' xs
+-- The mapAccumR function behaves like a combination of fmap and foldr; it applies
+-- a function to each element of a structure, passing an accumulating parameter
+-- from right to left, and returning a final value of this accumulator together
+-- with the new structure. Monadic version of 'mapAccumR'
+mapAccumRM :: Monad m => (acc -> x -> m (acc, y)) -> acc -> [x] -> m (acc, [y])
+mapAccumRM _ acc [] = return (acc, [])
+mapAccumRM f acc (x:xs) = do
+  (acc', ys) <- mapAccumRM f acc xs
+  (acc'', y) <- f acc' x
   return (acc'', y:ys)
-#endif
 
 -- | Turn a test tree into a list of actions to run tests coupled with
 -- variables to watch them.
@@ -337,14 +331,14 @@ createTestActions opts0 tree0 = do
     TestGroup (Sequential depType) testName testTrees ->
       fmap
         -- Add all tests of /nth/ tree to the dependencies of /(n+1)th/ tree
-        (second (mconcat . snd . mapAccumL (goSeqGroup depType) deps . reverse))
+        (second (mconcat . snd . mapAccumL (goSeqGroup depType) deps))
 
         -- If a test is selected for running, make sure all its dependencies
         -- run too by setting the 'forceFilter' argument.
-        (mapAccumM
+        (mapAccumRM
           (go (path |> testName) opts mempty)
           forceFilter
-          (reverse testTrees))
+          testTrees)
 
     PlusTestOptions f tree ->
       go path (f opts) deps forceFilter tree

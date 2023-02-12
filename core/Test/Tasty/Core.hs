@@ -8,7 +8,7 @@ import Control.Exception
 import Data.Bifunctor (second)
 import Data.Coerce (coerce)
 import Data.Foldable
-import Data.List (mapAccumL)
+import Data.List (mapAccumL, mapAccumR)
 import Data.Monoid
 import Data.Tagged
 import Data.Typeable
@@ -447,8 +447,8 @@ foldTestTree (TreeFold fTest fGroup fAfter) opts0 tree0 =
             (foldMap (go (path Seq.|> name) opts forceMatch) trees)
         TestGroup (Sequential _) name trees ->
           second
-            (fGroup opts name . mconcat . reverse)
-            (mapAccumL (go (path Seq.|> name) opts) forceMatch (reverse trees))
+            (fGroup opts name . mconcat)
+            (mapAccumR (go (path Seq.|> name) opts) forceMatch trees)
         PlusTestOptions f tree -> go path (f opts) forceMatch tree
         WithResource (ResourceSpec res _) tree -> go path opts forceMatch (tree res)
         AskOptions f -> go path opts forceMatch (f opts)
