@@ -11,6 +11,7 @@ import Resources
 import Timeouts
 import Dependencies
 import AWK
+import SequentialTestGroup
 
 main :: IO ()
 main = do
@@ -23,6 +24,7 @@ mainGroup = do
     [ testResources
     , testTimeouts
     , testDependencies
+    , testSequentialTestGroup
     , patternTests
     , awkTests_
     , optionMessagesTests
@@ -67,7 +69,7 @@ getTestNames =
   foldTestTree
     trivialFold
       { foldSingle = \_ name _ -> [name]
-      , foldGroup = \_opts n l -> map ((n ++ ".") ++) (concat l)
+      , foldGroup = \_opts _execMode n l -> map ((n ++ ".") ++) (concat l)
       }
 
 -- the tree being tested

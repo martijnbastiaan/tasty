@@ -16,8 +16,10 @@ module Test.Tasty.Core
   , ResourceSpec(..)
   , ResourceError(..)
   , DependencyType(..)
+  , ExecutionMode(..)
   , TestTree(..)
   , testGroup
+  , sequentialTestGroup
   , after
   , after_
   , TreeFold(..)
@@ -29,6 +31,10 @@ module Test.Tasty.Core
 
 import Control.Exception
 import qualified Data.Map as Map
+import Data.Bifunctor (Bifunctor(second, bimap))
+import Data.List (mapAccumR)
+import Data.Monoid (Any (getAny, Any))
+import Data.Sequence ((|>))
 import qualified Data.Sequence as Seq
 import Data.Tagged
 import Data.Typeable
@@ -245,6 +251,13 @@ data DependencyType
     -- regardless of whether they succeed or not.
   deriving (Eq, Show)
 
+-- | Determines mode of execution of a 'TestGroupWithMode'
+data ExecutionMode
+  = Sequential DependencyType
+  -- ^ Execute tests one after another
+  | Parallel
+  -- ^ Execute tests in parallel
+
 -- | The main data structure defining a test suite.
 --
 -- It consists of individual test cases and properties, organized in named
@@ -260,7 +273,7 @@ data DependencyType
 data TestTree
   = forall t . IsTest t => SingleTest TestName t
     -- ^ A single test of some particular type
-  | TestGroup TestName [TestTree]
+  | TestGroup ExecutionMode TestName [TestTree]
     -- ^ Assemble a number of tests into a cohesive group
   | PlusTestOptions (OptionSet -> OptionSet) TestTree
     -- ^ Add some options to child tests
@@ -281,11 +294,17 @@ data TestTree
     --
     -- @since 1.2
 
--- | Create a named group of test cases or other groups
+-- | Create a named group of test cases or other groups. Tests are executed in
+-- parallel. For sequential execution, see 'sequentialTestGroup'.
 --
 -- @since 0.1
 testGroup :: TestName -> [TestTree] -> TestTree
-testGroup = TestGroup
+testGroup = TestGroup Parallel
+
+-- | Create a named group of test cases or other groups. Tests are executed in
+-- order. For parallel execution, see 'testGroup'.
+sequentialTestGroup :: TestName -> DependencyType -> [TestTree] -> TestTree
+sequentialTestGroup nm depType = TestGroup (Sequential depType) nm
 
 -- | Like 'after', but accepts the pattern as a syntax tree instead
 -- of a string. Useful for generating a test tree programmatically.
@@ -370,7 +389,7 @@ after deptype s =
 -- @since 0.7
 data TreeFold b = TreeFold
   { foldSingle :: forall t . IsTest t => OptionSet -> TestName -> t -> b
-  , foldGroup :: OptionSet -> TestName -> [b] -> b
+  , foldGroup :: OptionSet -> ExecutionMode -> TestName -> [b] -> b
   -- ^ @since 1.4
   , foldResource :: forall a . OptionSet -> ResourceSpec a -> (IO a -> b) -> b
   , foldAfter :: OptionSet -> DependencyType -> Expr -> b -> b
@@ -393,10 +412,21 @@ data TreeFold b = TreeFold
 trivialFold :: Monoid b => TreeFold b
 trivialFold = TreeFold
   { foldSingle = \_ _ _ -> mempty
-  , foldGroup = \_ _ bs -> mconcat bs
+  , foldGroup = \_ _ _ bs -> mconcat bs
   , foldResource = \_ _ f -> f $ throwIO NotRunningTests
   , foldAfter = \_ _ _ b -> b
   }
+
+
+-- | Indicates whether a test matched in an evaluated subtree. If no filter was
+-- used, tests always match.
+type TestMatched = Any
+
+-- | Used to force tests to be included, even if they would be filtered out by
+-- a user's filter. This is used to force dependencies of a test to run. For
+-- example, if test @A@ depends on test @B@ and test @A@ is selected to run, test
+-- @B@ will be forced to match.
+type ForceTestMatch = Any
 
 -- | Fold a test tree into a single value.
 --
@@ -440,15 +470,15 @@ foldTestTree0
      -- ^ the tree to fold
   -> b
 foldTestTree0 empty (TreeFold fTest fGroup fResource fAfter) opts0 tree0 =
-  go (filterByPattern (evaluateOptions opts0 tree0))
+  go (filterByPattern (annotatePath (evaluateOptions opts0 tree0)))
   where
     go :: AnnTestTree OptionSet -> b
     go = \case
-      AnnEmptyTestTree               -> empty
-      AnnSingleTest opts name test   -> fTest opts name test
-      AnnTestGroup opts name trees   -> fGroup opts name (map go trees)
-      AnnWithResource opts res0 tree -> fResource opts res0 $ \res -> go (tree res)
-      AnnAfter opts deptype dep tree -> fAfter opts deptype dep (go tree)
+      AnnEmptyTestTree                      -> empty
+      AnnSingleTest opts name test          -> fTest opts name test
+      AnnTestGroup opts execMode name trees -> fGroup opts execMode name (map go trees)
+      AnnWithResource opts res0 tree        -> fResource opts res0 $ \res -> go (tree res)
+      AnnAfter opts deptype dep tree        -> fAfter opts deptype dep (go tree)
 
 -- | 'TestTree' with arbitrary annotations, e. g., evaluated 'OptionSet'.
 data AnnTestTree ann
@@ -456,7 +486,7 @@ data AnnTestTree ann
   -- ^ Just an empty test tree (e. g., when everything has been filtered out).
   | forall t . IsTest t => AnnSingleTest ann TestName t
   -- ^ Annotated counterpart of 'SingleTest'.
-  | AnnTestGroup ann TestName [AnnTestTree ann]
+  | AnnTestGroup ann ExecutionMode TestName [AnnTestTree ann]
   -- ^ Annotated counterpart of 'TestGroup'.
   | forall a . AnnWithResource ann (ResourceSpec a) (IO a -> AnnTestTree ann)
   -- ^ Annotated counterpart of 'WithResource'.
@@ -468,8 +498,8 @@ evaluateOptions :: OptionSet -> TestTree -> AnnTestTree OptionSet
 evaluateOptions opts = \case
   SingleTest name test ->
     AnnSingleTest opts name test
-  TestGroup name trees ->
-    AnnTestGroup opts name $ map (evaluateOptions opts) trees
+  TestGroup execMode name trees ->
+    AnnTestGroup opts execMode name $ map (evaluateOptions opts) trees
   PlusTestOptions f tree ->
     evaluateOptions (f opts) tree
   WithResource res0 tree ->
@@ -479,23 +509,61 @@ evaluateOptions opts = \case
   After deptype dep tree ->
     AnnAfter opts deptype dep $ evaluateOptions opts tree
 
--- | Filter test tree by pattern, replacing leafs with 'AnnEmptyTestTree'.
-filterByPattern :: AnnTestTree OptionSet -> AnnTestTree OptionSet
-filterByPattern = go mempty
+-- | Annotate 'AnnTestTree' with paths.
+annotatePath :: AnnTestTree OptionSet -> AnnTestTree (OptionSet, Path)
+annotatePath = go mempty
   where
-    go :: Seq.Seq TestName -> AnnTestTree OptionSet -> AnnTestTree OptionSet
+    go :: Seq.Seq TestName -> AnnTestTree OptionSet -> AnnTestTree (OptionSet, Path)
     go path = \case
       AnnEmptyTestTree -> AnnEmptyTestTree
-      t@(AnnSingleTest opts name _)
-        | testPatternMatches (lookupOption opts) (path Seq.|> name)
-          -> t
-        | otherwise -> AnnEmptyTestTree
-      AnnTestGroup opts name trees ->
-        AnnTestGroup opts name $ map (go (path Seq.|> name)) trees
+      AnnSingleTest opts name tree -> 
+        AnnSingleTest (opts, path |> name) name tree
+      AnnTestGroup opts execMode name trees ->
+        let newPath = path |> name in
+        AnnTestGroup (opts, newPath) execMode name (map (go newPath) trees)
       AnnWithResource opts res0 tree ->
-        AnnWithResource opts res0 $ \res -> go path (tree res)
+        AnnWithResource (opts, path) res0 $ \res -> go path (tree res)
       AnnAfter opts deptype dep tree ->
-        AnnAfter opts deptype dep (go path tree)
+        AnnAfter (opts, path) deptype dep (go path tree)
+
+-- | Filter test tree by pattern, replacing leafs with 'AnnEmptyTestTree'.
+filterByPattern :: AnnTestTree (OptionSet, Path) -> AnnTestTree OptionSet
+filterByPattern = snd . go mempty
+  where
+    go 
+      :: ForceTestMatch
+      -> AnnTestTree (OptionSet, Path)
+      -> (TestMatched, AnnTestTree OptionSet)
+    go forceMatch = \case
+      AnnEmptyTestTree ->
+        (Any False, AnnEmptyTestTree)
+
+      AnnSingleTest (opts, path) name tree
+        | getAny forceMatch || testPatternMatches (lookupOption opts) path
+        -> (Any True, AnnSingleTest opts name tree)
+        | otherwise 
+        -> (Any False, AnnEmptyTestTree)
+
+      AnnTestGroup (opts, _) Parallel name trees ->
+        bimap
+          mconcat
+          (AnnTestGroup opts Parallel name)
+          (unzip (map (go forceMatch) trees))
+
+      AnnTestGroup (opts, _) execMode@(Sequential _) name trees ->
+        second
+          (AnnTestGroup opts execMode name)
+          (mapAccumR go forceMatch trees)
+
+      AnnWithResource (opts, _) res0 tree ->
+        ( fst (go forceMatch (tree (throwIO NotRunningTests)))
+        , AnnWithResource opts res0 $ \res -> snd (go forceMatch (tree res))
+        )
+
+      AnnAfter (opts, _) deptype dep tree ->
+        second
+          (AnnAfter opts deptype dep)
+          (go forceMatch tree)
 
 -- | Get the list of options that are relevant for a given test tree
 treeOptions :: TestTree -> [OptionDescription]

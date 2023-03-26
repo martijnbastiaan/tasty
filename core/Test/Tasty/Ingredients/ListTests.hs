@@ -35,7 +35,7 @@ testsNames {- opts -} {- tree -} =
   foldTestTree
     trivialFold
       { foldSingle = \_opts name _test -> [name]
-      , foldGroup = \_opts groupName names -> map ((groupName ++ ".") ++) (concat names)
+      , foldGroup = \_opts _execMode groupName names -> map ((groupName ++ ".") ++) (concat names)
       }
 
 -- | The ingredient that provides the test listing functionality.
